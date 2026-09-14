@@ -1,4 +1,5 @@
 .streamlit/secrets.toml
+customers.json
 venv/
 __pycache__/
 *.pyc
