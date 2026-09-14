@@ -1,549 +1,700 @@
-import streamlit as st
-import requests
+
+import json
+from datetime import datetime
+from html import escape
+from pathlib import Path
+
 import folium
+import requests
+import streamlit as st
 from streamlit_folium import st_folium
 
-ORS_ROUTE_URL = "https://api.openrouteservice.org/v2/directions/driving-car"
 
-st.set_page_config(
-    page_title="Route Planner",
-    page_icon="🚗",
-    layout="centered",
-    initial_sidebar_state="collapsed"
+ORS_ROUTE_URL = (
+    "https://api.openrouteservice.org/v2/directions/driving-car"
 )
 
-# ---------- PRESET LOCATIONS IN KRAGUJEVAC ----------
+CUSTOMERS_FILE = Path("customers.json")
 
-KRAGUJEVAC_PLACES = [
+
+PLACES = [
     {
-        "label": "Vega restoran",
+        "name": "Vega restoran",
         "lat": 44.011855041271275,
         "lon": 20.916311519638494,
     },
     {
-        "label": "Srce",
+        "name": "Srce",
         "lat": 44.01324185166865,
         "lon": 20.91201666710037,
     },
     {
-        "label": "Restoran Dvoriste",
+        "name": "Restoran Dvoriste",
         "lat": 44.01646983546425,
         "lon": 20.92433264375116,
     },
     {
-        "label": "Veliki Park",
+        "name": "Veliki Park",
         "lat": 44.017630642190554,
         "lon": 20.903026851772744,
     },
     {
-        "label": "BIG Fashion Plaza",
+        "name": "BIG Fashion Plaza",
         "lat": 44.00925320425192,
         "lon": 20.893582001586157,
     },
     {
-        "label": "Muzej 21. Oktobar",
+        "name": "Muzej 21. Oktobar",
         "lat": 44.02176176693374,
         "lon": 20.896715629870332,
     },
     {
-        "label": "Hotel Kragujevac",
+        "name": "Hotel Kragujevac",
         "lat": 44.01001815503685,
         "lon": 20.91482786655385,
     },
 ]
 
-# ---------- ROUTING HELPER ----------
 
-def decode_polyline(s):
-    out = []
-    i = 0
-    lat = lon = 0
-    while i < len(s):
-        vals = []
-        for _ in range(2):
-            shift = result = 0
-            while True:
-                b = ord(s[i]) - 63
-                i += 1
-                result |= (b & 31) << shift
-                shift += 5
-                if b < 32:
-                    break
-            vals.append(~(result >> 1) if result & 1 else result >> 1)
-        lat += vals[0]
-        lon += vals[1]
-        out.append((lat / 1e5, lon / 1e5))
-    return out
+st.set_page_config(
+    page_title="Collection Route",
+    page_icon="🚛",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-def route(a, b, key):
-    r = requests.post(
-        ORS_ROUTE_URL,
-        headers={"Authorization": key, "Content-Type": "application/json"},
-        json={"coordinates": [[a[1], a[0]], [b[1], b[0]]]},
-        timeout=20
-    )
-    r.raise_for_status()
-    data = r.json()
-    item = data["routes"][0]
-    geom = item["geometry"]
-    if isinstance(geom, str):
-        coords = decode_polyline(geom)
-    else:
-        coords = [(lat, lon) for lon, lat in geom["coordinates"]]
-    km = item["summary"]["distance"] / 1000.0
-    mins = item["summary"]["duration"] / 60.0
-    return coords, km, mins
-
-# ---------- API KEY ----------
 
 try:
-    key = st.secrets.openrouteservice.api_key
+    API_KEY = st.secrets.openrouteservice.api_key
 except Exception:
-    st.error("Add [openrouteservice] api_key to Streamlit secrets.")
+    st.error(
+        "Missing [openrouteservice] api_key in Streamlit secrets."
+    )
     st.stop()
 
-st.title("🚗 Route Planner")
-st.caption("Kragujevac – preset locations")
 
-# ---------- SESSION STATE ----------
+def initialize_state():
+    if "customers" not in st.session_state:
+        st.session_state.customers = load_customers()
 
-if "start" not in st.session_state:
-    st.session_state.start = None
-if "end" not in st.session_state:
-    st.session_state.end = None
-if "route_result" not in st.session_state:
-    st.session_state.route_result = None
-
-# ---------- PRESET LOCATIONS UI ----------
-
-preset_labels = [p["label"] for p in KRAGUJEVAC_PLACES]
-
-col_start, col_end = st.columns(2)
-
-with col_start:
-    start_label = st.selectbox(
-        "Start",
-        preset_labels,
-        key="start_sel",
-        index=0
-    )
-
-with col_end:
-    end_label = st.selectbox(
-        "Destination",
-        preset_labels,
-        key="end_sel",
-        index=4
-    )
-
-if st.button("Calculate route", type="primary", use_container_width=True):
-    start_chosen = KRAGUJEVAC_PLACES[preset_labels.index(start_label)]
-    end_chosen = KRAGUJEVAC_PLACES[preset_labels.index(end_label)]
-
-    st.session_state.start = start_chosen
-    st.session_state.end = end_chosen
-
-    try:
-        coords, km, mins = route(
-            (start_chosen["lat"], start_chosen["lon"]),
-            (end_chosen["lat"], end_chosen["lon"]),
-            key
-        )
-        st.session_state.route_result = {
-            "coords": coords,
-            "km": km,
-            "mins": mins,
-            "start": start_chosen,
-            "end": end_chosen,
-        }
-    except Exception as e:
-        st.error(f"Route failed: {e}")
+    if "route_result" not in st.session_state:
         st.session_state.route_result = None
 
-# ---------- DISPLAY ROUTE & MAP ----------
+    if "form_message" not in st.session_state:
+        st.session_state.form_message = None
 
-if st.session_state.route_result:
-    res = st.session_state.route_result
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.metric("Distance", f"{res['km']:.2f} km")
-    with c2:
-        st.metric("Estimated time", f"{res['mins']:.1f} min")
+def load_customers():
+    if not CUSTOMERS_FILE.exists():
+        return []
 
-    # Center map roughly on Kragujevac, or on start point
-    center_lat = (res["start"]["lat"] + res["end"]["lat"]) / 2
-    center_lon = (res["start"]["lon"] + res["end"]["lon"]) / 2
+    try:
+        with CUSTOMERS_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            data = json.load(file)
 
-    m = folium.Map(
-        location=[center_lat, center_lon],
-        zoom_start=13
+        if isinstance(data, list):
+            return data
+
+        return []
+
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_customers():
+    temporary_file = CUSTOMERS_FILE.with_suffix(".tmp")
+
+    with temporary_file.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            st.session_state.customers,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    temporary_file.replace(CUSTOMERS_FILE)
+
+
+def decode_polyline(encoded):
+    coordinates = []
+    index = 0
+    latitude = 0
+    longitude = 0
+
+    while index < len(encoded):
+        values = []
+
+        for _ in range(2):
+            shift = 0
+            value = 0
+
+            while True:
+                byte = ord(encoded[index]) - 63
+                index += 1
+
+                value |= (byte & 31) << shift
+                shift += 5
+
+                if byte < 32:
+                    break
+
+            decoded = (
+                ~(value >> 1)
+                if value & 1
+                else value >> 1
+            )
+
+            values.append(decoded)
+
+        latitude += values[0]
+        longitude += values[1]
+
+        coordinates.append(
+            (
+                latitude / 100000,
+                longitude / 100000,
+            )
+        )
+
+    return coordinates
+
+
+def get_route(start, destination):
+    response = requests.post(
+        ORS_ROUTE_URL,
+        headers={
+            "Authorization": API_KEY,
+            "Content-Type": "application/json",
+        },
+        json={
+            "coordinates": [
+                [
+                    start["lon"],
+                    start["lat"],
+                ],
+                [
+                    destination["lon"],
+                    destination["lat"],
+                ],
+            ]
+        },
+        timeout=20,
     )
 
-    folium.Marker(
-        [res["start"]["lat"], res["start"]["lon"]],
-        tooltip="Start",
-        popup=res["start"]["label"],
-        icon=folium.Icon(color="green")
-    ).add_to(m)
+    response.raise_for_status()
+
+    route_data = response.json()["routes"][0]
+    geometry = route_data["geometry"]
+
+    if isinstance(geometry, str):
+        route_coordinates = decode_polyline(geometry)
+    else:
+        route_coordinates = [
+            (lat, lon)
+            for lon, lat in geometry["coordinates"]
+        ]
+
+    return {
+        "coordinates": route_coordinates,
+        "distance_km": (
+            route_data["summary"]["distance"] / 1000
+        ),
+        "duration_minutes": (
+            route_data["summary"]["duration"] / 60
+        ),
+        "start": start,
+        "destination": destination,
+    }
+
+
+def customer_as_route_place(customer):
+    return {
+        "name": f"Customer: {customer['name']}",
+        "lat": customer["lat"],
+        "lon": customer["lon"],
+        "customer_id": customer["id"],
+    }
+
+
+def get_all_route_places():
+    preset_places = [
+        {
+            "name": place["name"],
+            "lat": place["lat"],
+            "lon": place["lon"],
+            "place_type": "preset",
+        }
+        for place in PLACES
+    ]
+
+    customer_places = [
+        {
+            "name": (
+                f"Customer: {customer['name']} "
+                f"— {customer['address'] or 'No address'}"
+            ),
+            "lat": customer["lat"],
+            "lon": customer["lon"],
+            "place_type": "customer",
+            "customer_id": customer["id"],
+        }
+        for customer in st.session_state.customers
+    ]
+
+    return preset_places + customer_places
+
+
+def find_customer(customer_id):
+    for customer in st.session_state.customers:
+        if customer["id"] == customer_id:
+            return customer
+
+    return None
+
+
+def customer_popup_html(customer):
+    name = escape(customer.get("name", ""))
+    address = escape(
+        f"{customer.get('address', '')}, "
+        f"{customer.get('city', '')}".strip(", ")
+    )
+    floor = escape(customer.get("floor", "") or "-")
+    door = escape(customer.get("door", "") or "-")
+    phone = escape(customer.get("phone", "") or "-")
+    bags = escape(str(customer.get("bags", 0)))
+    notes = escape(customer.get("notes", "") or "No instructions")
+    status = escape(customer.get("status", "Pending"))
+
+    return f"""
+    <div style="font-size: 14px; min-width: 220px;">
+        <h4 style="margin: 0 0 8px 0;">{name}</h4>
+        <b>Address:</b> {address}<br>
+        <b>Floor:</b> {floor}<br>
+        <b>Door:</b> {door}<br>
+        <b>Phone:</b> {phone}<br>
+        <b>Bags:</b> {bags}<br>
+        <b>Status:</b> {status}<br>
+        <b>Instructions:</b><br>
+        {notes}
+    </div>
+    """
+
+
+def create_map(route_result, customers):
+    if route_result:
+        start = route_result["start"]
+        destination = route_result["destination"]
+
+        center_lat = (
+            start["lat"] + destination["lat"]
+        ) / 2
+
+        center_lon = (
+            start["lon"] + destination["lon"]
+        ) / 2
+
+        map_object = folium.Map(
+            location=[
+                center_lat,
+                center_lon,
+            ],
+            zoom_start=13,
+        )
+
+        folium.Marker(
+            [
+                start["lat"],
+                start["lon"],
+            ],
+            tooltip=f"Start: {start['name']}",
+            popup=start["name"],
+            icon=folium.Icon(
+                color="green",
+                icon="play",
+                prefix="fa",
+            ),
+        ).add_to(map_object)
+
+        folium.Marker(
+            [
+                destination["lat"],
+                destination["lon"],
+            ],
+            tooltip=(
+                f"Destination: "
+                f"{destination['name']}"
+            ),
+            popup=destination["name"],
+            icon=folium.Icon(
+                color="red",
+                icon="flag",
+                prefix="fa",
+            ),
+        ).add_to(map_object)
+
+        folium.PolyLine(
+            route_result["coordinates"],
+            color="blue",
+            weight=5,
+            tooltip="Driving route",
+        ).add_to(map_object)
+
+    else:
+        map_object = folium.Map(
+            location=[
+                44.01667,
+                20.91667,
+            ],
+            zoom_start=13,
+        )
+
+    for customer in customers:
+        if customer["status"] == "Pending":
+            marker_color = "orange"
+        else:
+            marker_color = "gray"
+
+        popup = folium.Popup(
+            customer_popup_html(customer),
+            max_width=320,
+        )
+
+        tooltip = (
+            f"{customer['name']} — "
+            f"{customer['address'] or 'No address'}"
+        )
+
+        folium.Marker(
+            [
+                customer["lat"],
+                customer["lon"],
+            ],
+            tooltip=tooltip,
+            popup=popup,
+            icon=folium.Icon(
+                color=marker_color,
+                icon="user",
+                prefix="fa",
+            ),
+        ).add_to(map_object)
+
+    return map_object
+
+
+initialize_state()
+
+
+st.title("🚛 Collection Route")
+
+st.caption(
+    "Customers are saved locally in customers.json "
+    "for testing."
+)
+
+
+if st.session_state.form_message:
+    st.success(
+        st.session_state.form_message
+    )
+    st.session_state.form_message = None
+
+
+left_column, right_column = st.columns(
+    [2, 1],
+    gap="large",
+)
+
+
+with right_column:
+    st.subheader("Customer management")
+
+    with st.expander(
+        "➕ Add new customer",
+        expanded=False,
+    ):
+        with st.form(
+            "customer_form",
+            clear_on_submit=True,
+        ):
+            name = st.text_input(
+                "Customer name *"
+            )
+
+            phone = st.text_input(
+                "Phone"
+            )
+
+            address = st.text_input(
+                "Address / street"
+            )
+
+            city = st.text_input(
+                "City",
+                value="Kragujevac",
+            )
+
+            floor = st.text_input(
+                "Floor"
+            )
+
+            door = st.text_input(
+                "Door / apartment"
+            )
+
+            bags = st.number_input(
+                "Expected bags",
+                min_value=0,
+                step=1,
+            )
+
+            notes = st.text_area(
+                "Pickup instructions"
+            )
+
+            st.write("Coordinates")
+
+            latitude = st.number_input(
+                "Latitude",
+                min_value=-90.0,
+                max_value=90.0,
+                value=44.01667,
+                format="%.8f",
+            )
+
+            longitude = st.number_input(
+                "Longitude",
+                min_value=-180.0,
+                max_value=180.0,
+                value=20.91667,
+                format="%.8f",
+            )
+
+            save_customer_button = (
+                st.form_submit_button(
+                    "Save customer",
+                    type="primary",
+                    use_container_width=True,
+                )
+            )
+
+        if save_customer_button:
+            if not name.strip():
+                st.error(
+                    "Customer name is required."
+                )
+            else:
+                new_customer = {
+                    "id": datetime.now().strftime(
+                        "%Y%m%d%H%M%S%f"
+                    ),
+                    "name": name.strip(),
+                    "phone": phone.strip(),
+                    "address": address.strip(),
+                    "city": city.strip(),
+                    "floor": floor.strip(),
+                    "door": door.strip(),
+                    "bags": int(bags),
+                    "notes": notes.strip(),
+                    "lat": float(latitude),
+                    "lon": float(longitude),
+                    "status": "Pending",
+                    "completed_at": None,
+                }
+
+                st.session_state.customers.append(
+                    new_customer
+                )
+
+                save_customers()
+
+                st.session_state.form_message = (
+                    f"Customer '{new_customer['name']}' "
+                    "was added."
+                )
+
+                st.rerun()
+
+    st.subheader("Customer list")
+
+    if not st.session_state.customers:
+        st.info(
+            "No customers added yet."
+        )
+    else:
+        status_filter = st.selectbox(
+            "Filter customers",
+            [
+                "All",
+                "Pending",
+                "Completed",
+            ],
+            key="customer_filter",
+        )
+
+        for customer in st.session_state.customers:
+            if (
+                status_filter != "All"
+                and customer["status"] != status_filter
+            ):
+                continue
+
+            with st.container(border=True):
+                st.write(
+                    f"**{customer['name']}** — "
+                    f"{customer['status']}"
+                )
+
+                st.caption(
+                    f"{customer['address']}, "
+                    f"{customer['city']}"
+                )
+
+                st.caption(
+                    f"Floor: "
+                    f"{customer['floor'] or '-'} · "
+                    f"Door: "
+                    f"{customer['door'] or '-'}"
+                )
+
+                st.caption(
+                    f"Coordinates: "
+                    f"{customer['lat']:.6f}, "
+                    f"{customer['lon']:.6f}"
+                )
+
+                if customer["phone"]:
+                    st.caption(
+                        f"Phone: {customer['phone']}"
+                    )
+
+                if customer["notes"]:
+                    st.caption(
+                        f"Instructions: "
+                        f"{customer['notes']}"
+                    )
+
+                if customer["status"] == "Pending":
+                    button_label = (
+                        "Mark as completed"
+                    )
+                else:
+                    button_label = (
+                        "Mark as pending"
+                    )
+
+                if st.button(
+                    button_label,
+                    key=f"toggle_{customer['id']}",
+                    use_container_width=True,
+                ):
+                    if customer["status"] == "Pending":
+                        customer["status"] = "Completed"
+                        customer["completed_at"] = (
+                            datetime.now().isoformat(
+                                timespec="minutes"
+                            )
+                        )
+                    else:
+                        customer["status"] = "Pending"
+                        customer["completed_at"] = None
+
+                    save_customers()
+                    st.rerun()
+
+
+with left_column:
+    st.subheader("Route map")
+
+    route_places = get_all_route_places()
+    route_place_names = [
+        place["name"]
+        for place in route_places
+    ]
+
+    start_name = st.selectbox(
+        "Start location",
+        route_place_names,
+        index=0,
+        key="route_start",
+    )
+
+    destination_name = st.selectbox(
+        "Destination",
+        route_place_names,
+        index=min(
+            4,
+            len(route_place_names) - 1,
+        ),
+        key="route_destination",
+    )
+
+    if st.button(
+        "Calculate route",
+        type="primary",
+        use_container_width=True,
+    ):
+        start = next(
+            place
+            for place in route_places
+            if place["name"] == start_name
+        )
+
+        destination = next(
+            place
+            for place in route_places
+            if place["name"] == destination_name
+        )
+
+        try:
+            st.session_state.route_result = get_route(
+                start,
+                destination,
+            )
+
+        except Exception as error:
+            st.error(
+                f"Route failed: {error}"
+            )
+            st.session_state.route_result = None
+
+    if st.session_state.route_result:
+        result = st.session_state.route_result
+
+        metric_col1, metric_col2 = (
+            st.columns(2)
+        )
+
+        with metric_col1:
+            st.metric(
+                "Distance",
+                f"{result['distance_km']:.2f} km",
+            )
+
+        with metric_col2:
+            st.metric(
+                "Estimated time",
+                f"{result['duration_minutes']:.1f} min",
+            )
+
+    map_object = create_map(
+        st.session_state.route_result,
+        st.session_state.customers,
+    )
+
+    st_folium(
+        map_object,
+        height=600,
+        use_container_width=True,
+    )
 
-    folium.Marker(
-        [res["end"]["lat"], res["end"]["lon"]],
-        tooltip="Destination",
-        popup=res["end"]["label"],
-        icon=folium.Icon(color="red")
-    ).add_to(m)
 
-    folium.PolyLine(res["coords"], color="blue", weight=5).add_to(m)
 
-    st_folium(m, height=520, use_container_width=True)
-else:
-    # Show a simple overview map of Kragujevac when no route is selected
-    center_kg = 44.01667
-    lon_kg = 20.91667
 
-    m0 = folium.Map(location=[center_kg, lon_kg], zoom_start=12)
-    folium.Marker(
-        [center_kg, lon_kg],
-        tooltip="Kragujevac center",
-        popup="Kragujevac center",
-        icon=folium.Icon(color="gray", icon="info-sign")
-    ).add_to(m0)
 
-    st_folium(m0, height=520, use_container_width=True)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import streamlit as st
-# import requests
-# import folium
-# from streamlit_folium import st_folium
-
-# ORS_GEOCODE_URL = "https://api.openrouteservice.org/geocode/search"
-# ORS_ROUTE_URL = "https://api.openrouteservice.org/v2/directions/driving-car"
-
-# st.set_page_config(
-#     page_title="Route Planner",
-#     page_icon="🚗",
-#     layout="centered",
-#     initial_sidebar_state="collapsed"
-# )
-
-# # ---------- PRESET LOCATIONS IN KRAGUJEVAC ----------
-
-# KRAGUJEVAC_PLACES = [
-#     {
-#         "label": "Vega restoran",
-#         "lat": 44.011855041271275,
-#         "lon": 20.916311519638494,
-#     },
-#     {
-#         "label": "Srce",
-#         "lat": 44.01324185166865,
-#         "lon": 20.91201666710037,
-#     },
-#     {
-#         "label": "Restoran Dvoriste",
-#         "lat": 44.01646983546425,
-#         "lon": 20.92433264375116,
-#     },
-#     {
-#         "label": "Veliki Park",
-#         "lat": 44.017630642190554,
-#         "lon": 20.903026851772744,
-#     },
-#     {
-#         "label": "BIG Fashion Plaza",
-#         "lat": 44.00925320425192,
-#         "lon": 20.893582001586157,
-#     },
-#     {
-#         "label": "Muzej 21. Oktobar",
-#         "lat": 44.02176176693374,
-#         "lon": 20.896715629870332,
-#     },
-#     {
-#         "label": "Hotel Kragujevac",
-#         "lat": 44.01001815503685,
-#         "lon": 20.91482786655385,
-#     },
-# ]
-
-# # ---------- GEOCODING & ROUTING HELPERS ----------
-
-# @st.cache_data(ttl=300)
-# def geocode(query, api_key):
-#     r = requests.get(
-#         ORS_GEOCODE_URL,
-#         params={"text": query, "size": 5},
-#         headers={"Authorization": api_key},
-#         timeout=15
-#     )
-#     r.raise_for_status()
-#     results = []
-#     for f in r.json().get("features", []):
-#         lon, lat = f["geometry"]["coordinates"]
-#         props = f.get("properties", {})
-#         label = props.get("label", props.get("name", query))
-#         results.append({"label": label, "lat": lat, "lon": lon})
-#     return results
-
-# def decode_polyline(s):
-#     out = []
-#     i = 0
-#     lat = lon = 0
-#     while i < len(s):
-#         vals = []
-#         for _ in range(2):
-#             shift = result = 0
-#             while True:
-#                 b = ord(s[i]) - 63
-#                 i += 1
-#                 result |= (b & 31) << shift
-#                 shift += 5
-#                 if b < 32:
-#                     break
-#             vals.append(~(result >> 1) if result & 1 else result >> 1)
-#         lat += vals[0]
-#         lon += vals[1]
-#         out.append((lat / 1e5, lon / 1e5))
-#     return out
-
-# def route(a, b, key):
-#     r = requests.post(
-#         ORS_ROUTE_URL,
-#         headers={"Authorization": key, "Content-Type": "application/json"},
-#         json={"coordinates": [[a[1], a[0]], [b[1], b[0]]]},
-#         timeout=20
-#     )
-#     r.raise_for_status()
-#     data = r.json()
-#     item = data["routes"][0]
-#     geom = item["geometry"]
-#     if isinstance(geom, str):
-#         coords = decode_polyline(geom)
-#     else:
-#         coords = [(lat, lon) for lon, lat in geom["coordinates"]]
-#     km = item["summary"]["distance"] / 1000.0
-#     mins = item["summary"]["duration"] / 60.0
-#     return coords, km, mins
-
-# # ---------- API KEY ----------
-
-# try:
-#     key = st.secrets.openrouteservice.api_key
-# except Exception:
-#     st.error("Add [openrouteservice] api_key to Streamlit secrets.")
-#     st.stop()
-
-# st.title("🚗 Route Planner")
-# st.caption("Mobile-friendly route planner for Kragujevac")
-
-# # ---------- SESSION STATE ----------
-
-# if "start" not in st.session_state:
-#     st.session_state.start = None
-# if "end" not in st.session_state:
-#     st.session_state.end = None
-# if "route_result" not in st.session_state:
-#     st.session_state.route_result = None
-
-# # ---------- PRESET LOCATIONS UI ----------
-
-# st.subheader("1. Choose from preset locations")
-
-# preset_labels = [p["label"] for p in KRAGUJEVAC_PLACES]
-
-# st.markdown("**Start**")
-# preset_start_label = st.selectbox(
-#     "Preset start location",
-#     preset_labels,
-#     key="preset_start_sel",
-#     index=0
-# )
-# if st.button("Use this as start", key="use_preset_start", type="secondary"):
-#     chosen = KRAGUJEVAC_PLACES[preset_labels.index(preset_start_label)]
-#     st.session_state.start = chosen
-#     st.session_state.route_result = None
-
-# st.markdown("**Destination**")
-# preset_end_label = st.selectbox(
-#     "Preset destination location",
-#     preset_labels,
-#     key="preset_end_sel",
-#     index=4
-# )
-# if st.button("Use this as destination", key="use_preset_end", type="secondary"):
-#     chosen = KRAGUJEVAC_PLACES[preset_labels.index(preset_end_label)]
-#     st.session_state.end = chosen
-#     st.session_state.route_result = None
-
-# st.divider()
-
-# # ---------- GEOCODED SEARCH UI ----------
-
-# st.subheader("2. Or search any address")
-
-# start_query = st.text_input(
-#     "Search start address",
-#     key="start_q",
-#     placeholder="Kralja Petra I, Kragujevac, Serbia"
-# )
-
-# if start_query:
-#     try:
-#         start_choices = geocode(start_query, key)
-#         if start_choices:
-#             start_labels = [x["label"] for x in start_choices]
-#             start_selected = st.selectbox("Choose start", start_labels, key="start_sel")
-#             start_chosen = start_choices[start_labels.index(start_selected)]
-#             if st.button("Set as start", key="set_start", type="secondary"):
-#                 st.session_state.start = start_chosen
-#                 st.session_state.route_result = None
-#         else:
-#             st.warning("No results. Try adding city and country.")
-#     except requests.HTTPError as e:
-#         st.error(f"Search failed: {e}")
-
-# end_query = st.text_input(
-#     "Search destination address",
-#     key="end_q",
-#     placeholder="Šumarice, Kragujevac, Serbia"
-# )
-
-# if end_query:
-#     try:
-#         end_choices = geocode(end_query, key)
-#         if end_choices:
-#             end_labels = [x["label"] for x in end_choices]
-#             end_selected = st.selectbox("Choose destination", end_labels, key="end_sel")
-#             end_chosen = end_choices[end_labels.index(end_selected)]
-#             if st.button("Set as destination", key="set_end", type="secondary"):
-#                 st.session_state.end = end_chosen
-#                 st.session_state.route_result = None
-#         else:
-#             st.warning("No results. Try adding city and country.")
-#     except requests.HTTPError as e:
-#         st.error(f"Search failed: {e}")
-
-# st.divider()
-
-# # ---------- CURRENT SELECTION ----------
-
-# st.subheader("3. Current selection")
-
-# c1, c2 = st.columns(2)
-# with c1:
-#     start_label = st.session_state.start["label"] if st.session_state.start else "not selected"
-#     st.write(f"**Start:** {start_label}")
-# with c2:
-#     end_label = st.session_state.end["label"] if st.session_state.end else "not selected"
-#     st.write(f"**Destination:** {end_label}")
-
-# if st.button("Clear selections", key="clear_sel", type="secondary"):
-#     st.session_state.start = st.session_state.end = None
-#     st.session_state.route_result = None
-#     st.rerun()
-
-# st.divider()
-
-# # ---------- CALCULATE ROUTE ----------
-
-# st.subheader("4. Route")
-
-# if st.button("Calculate route", key="calc_route", type="primary", use_container_width=True):
-#     if not st.session_state.start or not st.session_state.end:
-#         st.warning("Select both locations first.")
-#     else:
-#         try:
-#             coords, km, mins = route(
-#                 (st.session_state.start["lat"], st.session_state.start["lon"]),
-#                 (st.session_state.end["lat"], st.session_state.end["lon"]),
-#                 key
-#             )
-#             st.session_state.route_result = {
-#                 "coords": coords,
-#                 "km": km,
-#                 "mins": mins,
-#                 "start": st.session_state.start,
-#                 "end": st.session_state.end,
-#             }
-#         except Exception as e:
-#             st.error(f"Route failed: {e}")
-#             st.session_state.route_result = None
-
-# # ---------- DISPLAY ROUTE ----------
-
-# if st.session_state.route_result:
-#     res = st.session_state.route_result
-
-#     c1, c2 = st.columns(2)
-#     with c1:
-#         st.metric("Distance", f"{res['km']:.2f} km")
-#     with c2:
-#         st.metric("Estimated time", f"{res['mins']:.1f} min")
-
-#     m = folium.Map(
-#         location=[res["start"]["lat"], res["start"]["lon"]],
-#         zoom_start=12
-#     )
-#     folium.Marker(
-#         [res["start"]["lat"], res["start"]["lon"]],
-#         tooltip="Start",
-#         icon=folium.Icon(color="green")
-#     ).add_to(m)
-
-#     folium.Marker(
-#         [res["end"]["lat"], res["end"]["lon"]],
-#         tooltip="Destination",
-#         icon=folium.Icon(color="red")
-#     ).add_to(m)
-
-#     folium.PolyLine(res["coords"], color="blue", weight=5).add_to(m)
-
-#     st_folium(m, height=500, use_container_width=True)
